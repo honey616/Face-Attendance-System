@@ -5,7 +5,7 @@ deepface
 retina-face
 tensorflow
 tf-keras
-opencv-python
+opencv-python-headless
 streamlit-webrtc
 av
 streamlit-autorefresh
