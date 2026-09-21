@@ -3,7 +3,7 @@ pandas
 numpy
 deepface
 retina-face
-tensorflow
+tensorflow==2.21.0
 tf-keras
 opencv-python-headless
 streamlit-webrtc
