@@ -1,11 +1,11 @@
 streamlit
-pandas
-numpy
-deepface
-retina-face
+pandas==2.2.3
+numpy==1.26.4
+deepface==0.0.100
+retina-face==0.0.17
 tensorflow==2.21.0
 tf-keras
-opencv-python-headless
+opencv-python-headless==4.10.0.84
 streamlit-webrtc
 av
 streamlit-autorefresh
