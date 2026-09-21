@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+
+employees.json
+attendance.csv
+known_faces/
+
+.streamlit/secrets.toml
