@@ -1,28 +1,29 @@
 import os
+
+# TensorFlow / native library stability settings
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
+os.environ["TF_NUM_INTEROP_THREADS"] = "1"
+
 import json
 import tempfile
+import threading
 import time
-from datetime import datetime
+from datetime import datetime, date
 
 import av
-import streamlit as st
-
-try:
-    import cv2
-except ImportError as e:
-    st.error(f"OpenCV could not be loaded: {e}")
-    st.stop()
-
+import cv2
 import numpy as np
 import pandas as pd
+import streamlit as st
 
-from deepface import DeepFace
 from streamlit_webrtc import (
     webrtc_streamer,
     VideoProcessorBase,
     WebRtcMode,
 )
-
 from streamlit_autorefresh import st_autorefresh
 
 
@@ -31,26 +32,7 @@ from streamlit_autorefresh import st_autorefresh
 # ============================================================
 
 APP_NAME = "Employee Attendance System"
-APP_VERSION = "3.0.0"
-
-BASE_DIR = os.path.dirname(
-    os.path.abspath(__file__)
-)
-
-EMPLOYEES_FILE = os.path.join(
-    BASE_DIR,
-    "employees.json"
-)
-
-ATTENDANCE_FILE = os.path.join(
-    BASE_DIR,
-    "attendance.csv"
-)
-
-KNOWN_FACES_DIR = os.path.join(
-    BASE_DIR,
-    "known_faces"
-)
+APP_VERSION = "3.1.0"
 
 MODEL_NAME = "Facenet512"
 DETECTOR_BACKEND = "opencv"
@@ -58,25 +40,35 @@ DISTANCE_METRIC = "cosine"
 
 MATCH_THRESHOLD = 0.30
 
+# Same employee cannot create another event within this time
 SCAN_COOLDOWN_SECONDS = 60
 
+# Process one frame every N frames
 PROCESS_EVERY_N_FRAMES = 20
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+KNOWN_FACES_DIR = os.path.join(BASE_DIR, "known_faces")
+EMPLOYEES_FILE = os.path.join(BASE_DIR, "employees.json")
+ATTENDANCE_FILE = os.path.join(BASE_DIR, "attendance.csv")
+
+os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
 
 
 # ============================================================
-# PAGE CONFIGURATION
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
     page_title=APP_NAME,
     page_icon=None,
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
 
 # ============================================================
-# CORPORATE CSS
+# PROFESSIONAL CSS
 # ============================================================
 
 st.markdown(
@@ -96,253 +88,323 @@ st.markdown(
     }
 
     .block-container {
-        max-width: 1400px;
         padding-top: 2rem;
         padding-bottom: 2rem;
+        max-width: 1450px;
     }
 
-    .app-title {
-        font-size: 30px;
-        font-weight: 650;
-        letter-spacing: -0.4px;
-        margin-bottom: 3px;
-    }
-
-    .app-subtitle {
-        color: #667085;
-        font-size: 14px;
-        margin-bottom: 25px;
-    }
-
-    .section-title {
-        font-size: 21px;
-        font-weight: 600;
-        margin-bottom: 4px;
-    }
-
-    .section-description {
-        color: #667085;
-        font-size: 14px;
+    .app-header {
+        padding: 20px 24px;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        background: #ffffff;
         margin-bottom: 20px;
     }
 
-    .status-online {
-        color: #087443;
-        font-weight: 600;
+    .app-title {
+        font-size: 28px;
+        font-weight: 700;
+        color: #111827;
+        margin-bottom: 4px;
+    }
+
+    .app-subtitle {
+        color: #6b7280;
+        font-size: 14px;
+    }
+
+    .section-title {
+        font-size: 20px;
+        font-weight: 650;
+        color: #111827;
+        margin-top: 10px;
+        margin-bottom: 12px;
+    }
+
+    .status-box {
+        padding: 16px 18px;
+        border-radius: 10px;
+        border: 1px solid #e5e7eb;
+        background: #ffffff;
+        margin-top: 10px;
+        margin-bottom: 12px;
+    }
+
+    .status-title {
+        font-size: 13px;
+        color: #6b7280;
+        margin-bottom: 5px;
+    }
+
+    .status-value {
+        font-size: 20px;
+        font-weight: 700;
+        color: #111827;
+    }
+
+    .employee-card {
+        padding: 18px;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        background: #ffffff;
+        margin-bottom: 15px;
+    }
+
+    .employee-name {
+        font-size: 21px;
+        font-weight: 700;
+        color: #111827;
+    }
+
+    .employee-id {
+        color: #6b7280;
+        font-size: 14px;
+        margin-top: 3px;
+    }
+
+    .event-checkin {
+        color: #166534;
+        font-weight: 700;
+    }
+
+    .event-checkout {
+        color: #991b1b;
+        font-weight: 700;
+    }
+
+    .info-box {
+        padding: 14px 16px;
+        background: #f9fafb;
+        border: 1px solid #e5e7eb;
+        border-radius: 10px;
+        color: #374151;
+        font-size: 14px;
+        line-height: 1.6;
+    }
+
+    .footer-text {
+        color: #9ca3af;
+        font-size: 12px;
+        text-align: center;
+        padding-top: 30px;
+    }
+
+    div[data-testid="stMetric"] {
+        border: 1px solid #e5e7eb;
+        padding: 15px;
+        border-radius: 10px;
+        background: #ffffff;
     }
 
     </style>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
 
 
 # ============================================================
-# DIRECTORY INITIALIZATION
+# HEADER
 # ============================================================
 
-os.makedirs(
-    KNOWN_FACES_DIR,
-    exist_ok=True
+st.markdown(
+    f"""
+    <div class="app-header">
+        <div class="app-title">{APP_NAME}</div>
+        <div class="app-subtitle">
+            Automated face-based employee check-in and check-out
+            &nbsp; | &nbsp; Version {APP_VERSION}
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
 
 # ============================================================
-# STORAGE INITIALIZATION
+# DATA FILE INITIALIZATION
 # ============================================================
 
-def initialize_storage():
+def initialize_files():
+    """Create required JSON and CSV files if they don't exist."""
 
-    if not os.path.exists(
-        EMPLOYEES_FILE
-    ):
+    if not os.path.exists(EMPLOYEES_FILE):
+        with open(EMPLOYEES_FILE, "w", encoding="utf-8") as f:
+            json.dump({}, f, indent=4)
 
-        with open(
-            EMPLOYEES_FILE,
-            "w",
-            encoding="utf-8"
-        ) as file:
+    if not os.path.exists(ATTENDANCE_FILE):
+        columns = [
+            "employee_id",
+            "employee_name",
+            "event",
+            "timestamp",
+            "date",
+        ]
 
-            json.dump(
-                {},
-                file,
-                indent=4
-            )
-
-    if not os.path.exists(
-        ATTENDANCE_FILE
-    ):
-
-        df = pd.DataFrame(
-            columns=[
-                "Employee ID",
-                "Employee Name",
-                "Date",
-                "Event",
-                "Time"
-            ]
-        )
-
-        df.to_csv(
-            ATTENDANCE_FILE,
-            index=False
-        )
+        df = pd.DataFrame(columns=columns)
+        df.to_csv(ATTENDANCE_FILE, index=False)
 
 
-initialize_storage()
+initialize_files()
 
 
 # ============================================================
-# EMPLOYEE FUNCTIONS
+# EMPLOYEE STORAGE
 # ============================================================
 
 def load_employees():
-
     try:
+        with open(EMPLOYEES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-        with open(
-            EMPLOYEES_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
+        if not isinstance(data, dict):
+            return {}
 
-            data = json.load(file)
-
-        if isinstance(data, dict):
-            return data
-
-        return {}
+        return data
 
     except Exception:
-
         return {}
 
 
-def save_employees(
-    employees
-):
+def save_employees(data):
+    with open(EMPLOYEES_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
 
-    with open(
-        EMPLOYEES_FILE,
-        "w",
-        encoding="utf-8"
-    ) as file:
-
-        json.dump(
-            employees,
-            file,
-            indent=4
-        )
-
-
-# ============================================================
-# ATTENDANCE FUNCTIONS
-# ============================================================
 
 def load_attendance():
-
     try:
+        df = pd.read_csv(ATTENDANCE_FILE)
 
-        df = pd.read_csv(
-            ATTENDANCE_FILE
+        if df.empty:
+            return pd.DataFrame(
+                columns=[
+                    "employee_id",
+                    "employee_name",
+                    "event",
+                    "timestamp",
+                    "date",
+                ]
+            )
+
+        return df
+
+    except Exception:
+        return pd.DataFrame(
+            columns=[
+                "employee_id",
+                "employee_name",
+                "event",
+                "timestamp",
+                "date",
+            ]
         )
 
-    except (
-        FileNotFoundError,
-        pd.errors.EmptyDataError
-    ):
 
-        df = pd.DataFrame()
+def save_attendance(df):
+    df.to_csv(ATTENDANCE_FILE, index=False)
 
-    required_columns = [
-        "Employee ID",
-        "Employee Name",
-        "Date",
-        "Event",
-        "Time"
-    ]
 
-    if (
-        df.empty
-        or not all(
-            column in df.columns
-            for column in required_columns
-        )
-    ):
+# ============================================================
+# DEEPFACE - LAZY IMPORT
+# ============================================================
 
-        df = pd.DataFrame(
-            columns=required_columns
-        )
+@st.cache_resource(show_spinner=False)
+def load_deepface():
+    """
+    DeepFace is intentionally imported only when required.
+    This prevents Streamlit Cloud from loading TensorFlow/
+    DeepFace during initial application startup.
+    """
 
-    return df
+    from deepface import DeepFace
+
+    return DeepFace
 
 
 # ============================================================
 # FACE EMBEDDING
 # ============================================================
 
-def generate_embedding(
-    image_path
-):
+def generate_embedding(image_path):
+
+    DeepFace = load_deepface()
 
     result = DeepFace.represent(
         img_path=image_path,
         model_name=MODEL_NAME,
         detector_backend=DETECTOR_BACKEND,
         enforce_detection=True,
-        align=True
+        align=True,
     )
 
     if not result:
-
-        raise ValueError(
-            "No face detected."
-        )
+        raise ValueError("No face detected.")
 
     if len(result) != 1:
-
         raise ValueError(
             "Please keep only one face in front of the camera."
         )
 
-    return np.asarray(
+    embedding = np.asarray(
         result[0]["embedding"],
         dtype=np.float32
     )
+
+    return embedding
+
+
+# ============================================================
+# IMAGE HELPERS
+# ============================================================
+
+def save_uploaded_image(uploaded_file):
+
+    suffix = ".jpg"
+
+    if hasattr(uploaded_file, "name"):
+        extension = os.path.splitext(uploaded_file.name)[1]
+
+        if extension:
+            suffix = extension
+
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=suffix
+    ) as temp_file:
+
+        temp_file.write(uploaded_file.getvalue())
+        return temp_file.name
+
+
+def save_numpy_image(image):
+
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".jpg"
+    ) as temp_file:
+
+        cv2.imwrite(temp_file.name, image)
+
+        return temp_file.name
 
 
 # ============================================================
 # COSINE DISTANCE
 # ============================================================
 
-def cosine_distance(
-    embedding_a,
-    embedding_b
-):
+def cosine_distance(a, b):
 
-    a = np.asarray(
-        embedding_a,
-        dtype=np.float32
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+
+    denominator = (
+        np.linalg.norm(a) *
+        np.linalg.norm(b)
     )
 
-    b = np.asarray(
-        embedding_b,
-        dtype=np.float32
-    )
-
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-
-    if norm_a == 0 or norm_b == 0:
-
+    if denominator == 0:
         return 1.0
 
-    similarity = np.dot(
-        a,
-        b
-    ) / (
-        norm_a * norm_b
-    )
+    similarity = np.dot(a, b) / denominator
 
     similarity = np.clip(
         similarity,
@@ -350,135 +412,127 @@ def cosine_distance(
         1.0
     )
 
-    return float(
-        1.0 - similarity
-    )
+    return float(1.0 - similarity)
 
 
 # ============================================================
-# EMPLOYEE RECOGNITION
+# FACE RECOGNITION
 # ============================================================
 
-def recognize_employee(
-    query_embedding
-):
+def recognize_employee(embedding):
 
     employees = load_employees()
+
+    if not employees:
+        return None, None
 
     best_employee = None
     best_distance = float("inf")
 
     for employee_id, employee_data in employees.items():
 
-        if "embedding" not in employee_data:
+        stored_embedding = employee_data.get("embedding")
+
+        if not stored_embedding:
             continue
 
         try:
-
-            stored_embedding = np.asarray(
-                employee_data["embedding"],
-                dtype=np.float32
-            )
-
             distance = cosine_distance(
-                query_embedding,
+                embedding,
                 stored_embedding
             )
 
-            if distance < best_distance:
-
-                best_distance = distance
-                best_employee = employee_id
-
         except Exception:
-
             continue
 
-    if (
-        best_employee
-        and best_distance <= MATCH_THRESHOLD
-    ):
+        if distance < best_distance:
 
-        return (
-            best_employee,
-            best_distance
-        )
+            best_distance = distance
+            best_employee = employee_id
 
-    return (
-        None,
-        best_distance
+    if best_employee is None:
+        return None, None
+
+    if best_distance <= MATCH_THRESHOLD:
+
+        employee = employees[best_employee]
+
+        return {
+            "employee_id": best_employee,
+            "employee_name": employee.get(
+                "name",
+                best_employee
+            ),
+        }, best_distance
+
+    return None, best_distance
+
+
+# ============================================================
+# EVENT LOGIC
+# ============================================================
+
+def get_employee_events(employee_id):
+
+    df = load_attendance()
+
+    if df.empty:
+        return df
+
+    return df[
+        df["employee_id"].astype(str)
+        == str(employee_id)
+    ].copy()
+
+
+def get_next_event(employee_id):
+
+    employee_events = get_employee_events(
+        employee_id
     )
 
-
-# ============================================================
-# NEXT EVENT
-# ============================================================
-
-def get_next_event(
-    employee_id,
-    current_date
-):
-
-    attendance = load_attendance()
-
-    records = attendance[
-        (attendance["Employee ID"] == employee_id)
-        &
-        (attendance["Date"] == current_date)
-    ]
-
-    if records.empty:
-
+    if employee_events.empty:
         return "CHECK-IN"
 
-    last_event = str(
-        records.iloc[-1]["Event"]
+    employee_events = employee_events.sort_values(
+        "timestamp"
     )
 
-    if last_event == "CHECK-IN":
+    last_event = str(
+        employee_events.iloc[-1]["event"]
+    ).upper()
 
+    if last_event == "CHECK-IN":
         return "CHECK-OUT"
 
     return "CHECK-IN"
 
 
-# ============================================================
-# COOLDOWN
-# ============================================================
+def check_cooldown(employee_id):
 
-def check_cooldown(
-    employee_id,
-    current_date,
-    current_datetime
-):
+    df = get_employee_events(employee_id)
 
-    attendance = load_attendance()
+    if df.empty:
+        return True, 0
 
-    records = attendance[
-        (attendance["Employee ID"] == employee_id)
-        &
-        (attendance["Date"] == current_date)
-    ]
+    df["timestamp_dt"] = pd.to_datetime(
+        df["timestamp"],
+        errors="coerce"
+    )
 
-    if records.empty:
+    df = df.dropna(
+        subset=["timestamp_dt"]
+    )
 
-        return False, 0
+    if df.empty:
+        return True, 0
 
-    last_record = records.iloc[-1]
+    last_timestamp = df.iloc[-1]["timestamp_dt"]
 
-    try:
-
-        last_datetime = datetime.strptime(
-            f"{current_date} {last_record['Time']}",
-            "%Y-%m-%d %H:%M:%S"
-        )
-
-    except Exception:
-
-        return False, 0
+    now = datetime.now()
 
     elapsed = (
-        current_datetime - last_datetime
+        now - last_timestamp.to_pydatetime()
     ).total_seconds()
 
     if elapsed < SCAN_COOLDOWN_SECONDS:
@@ -487,221 +541,143 @@ def check_cooldown(
             SCAN_COOLDOWN_SECONDS - elapsed
         )
 
-        return True, remaining
+        return False, remaining
 
-    return False, 0
+    return True, 0
 
 
-# ============================================================
-# RECORD ATTENDANCE
-# ============================================================
+def record_event(employee_id, employee_name):
 
-def record_event(
-    employee_id
-):
-
-    employees = load_employees()
-    attendance = load_attendance()
-
-    employee_name = employees[
+    allowed, remaining = check_cooldown(
         employee_id
-    ]["name"]
+    )
+
+    if not allowed:
+
+        return {
+            "success": False,
+            "message": (
+                f"Please wait {remaining} seconds "
+                f"before the next scan."
+            ),
+            "event": None,
+        }
+
+    next_event = get_next_event(employee_id)
 
     now = datetime.now()
 
-    current_date = now.strftime(
-        "%Y-%m-%d"
-    )
+    new_row = {
+        "employee_id": employee_id,
+        "employee_name": employee_name,
+        "event": next_event,
+        "timestamp": now.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ),
+        "date": now.strftime("%Y-%m-%d"),
+    }
 
-    current_time = now.strftime(
-        "%H:%M:%S"
-    )
+    df = load_attendance()
 
-    cooldown, remaining = check_cooldown(
-        employee_id,
-        current_date,
-        now
-    )
-
-    if cooldown:
-
-        return {
-            "recorded": False,
-            "cooldown": True,
-            "remaining": remaining
-        }
-
-    event = get_next_event(
-        employee_id,
-        current_date
-    )
-
-    new_record = pd.DataFrame(
-        {
-            "Employee ID": [
-                employee_id
-            ],
-            "Employee Name": [
-                employee_name
-            ],
-            "Date": [
-                current_date
-            ],
-            "Event": [
-                event
-            ],
-            "Time": [
-                current_time
-            ]
-        }
-    )
-
-    attendance = pd.concat(
+    df = pd.concat(
         [
-            attendance,
-            new_record
+            df,
+            pd.DataFrame([new_row])
         ],
         ignore_index=True
     )
 
-    attendance.to_csv(
-        ATTENDANCE_FILE,
-        index=False
-    )
+    save_attendance(df)
 
     return {
-        "recorded": True,
-        "cooldown": False,
-        "employee_id": employee_id,
-        "employee_name": employee_name,
-        "event": event,
-        "date": current_date,
-        "time": current_time
+        "success": True,
+        "message": (
+            f"{employee_name} "
+            f"{next_event.replace('-', ' ')} "
+            f"successfully."
+        ),
+        "event": next_event,
     }
 
 
 # ============================================================
-# DAILY SUMMARY
+# DAILY WORKING HOURS
 # ============================================================
 
-def calculate_daily_summary(
+def calculate_employee_working_time(
     employee_id,
-    date
+    target_date=None
 ):
 
-    attendance = load_attendance()
+    if target_date is None:
+        target_date = date.today()
 
-    records = attendance[
-        (attendance["Employee ID"] == employee_id)
-        &
-        (attendance["Date"] == date)
-    ].reset_index(
-        drop=True
+    df = load_attendance()
+
+    if df.empty:
+        return 0, 0
+
+    df["timestamp_dt"] = pd.to_datetime(
+        df["timestamp"],
+        errors="coerce"
     )
 
-    if records.empty:
+    df = df[
+        df["employee_id"].astype(str)
+        == str(employee_id)
+    ]
 
-        return {
-            "first_checkin": "-",
-            "last_checkout": "-",
-            "visits": 0,
-            "working_seconds": 0,
-            "status": "OUT"
-        }
+    df = df[
+        df["timestamp_dt"].dt.date
+        == target_date
+    ]
+
+    if df.empty:
+        return 0, 0
+
+    df = df.sort_values(
+        "timestamp_dt"
+    )
 
     total_seconds = 0
-
     visits = 0
 
-    first_checkin = None
-    last_checkout = None
+    check_in_time = None
 
-    current_checkin = None
-
-    for _, row in records.iterrows():
+    for _, row in df.iterrows():
 
         event = str(
-            row["Event"]
-        )
+            row["event"]
+        ).upper()
 
-        time_string = str(
-            row["Time"]
-        )
-
-        try:
-
-            event_time = datetime.strptime(
-                f"{date} {time_string}",
-                "%Y-%m-%d %H:%M:%S"
-            )
-
-        except Exception:
-
-            continue
+        timestamp = row["timestamp_dt"]
 
         if event == "CHECK-IN":
 
-            if first_checkin is None:
-
-                first_checkin = event_time
-
-            current_checkin = event_time
+            check_in_time = timestamp
 
         elif (
             event == "CHECK-OUT"
-            and current_checkin is not None
+            and check_in_time is not None
         ):
 
-            duration = (
-                event_time
-                - current_checkin
+            seconds = (
+                timestamp - check_in_time
             ).total_seconds()
 
-            if duration >= 0:
+            if seconds >= 0:
 
-                total_seconds += duration
+                total_seconds += seconds
                 visits += 1
 
-            last_checkout = event_time
+            check_in_time = None
 
-            current_checkin = None
-
-    status = (
-        "IN"
-        if current_checkin is not None
-        else "OUT"
-    )
-
-    return {
-        "first_checkin": (
-            first_checkin.strftime(
-                "%H:%M:%S"
-            )
-            if first_checkin
-            else "-"
-        ),
-        "last_checkout": (
-            last_checkout.strftime(
-                "%H:%M:%S"
-            )
-            if last_checkout
-            else "-"
-        ),
-        "visits": visits,
-        "working_seconds": int(
-            total_seconds
-        ),
-        "status": status
-    }
+    return total_seconds, visits
 
 
-# ============================================================
-# FORMAT DURATION
-# ============================================================
+def format_duration(seconds):
 
-def format_duration(
-    seconds
-):
+    seconds = int(seconds)
 
     hours = seconds // 3600
 
@@ -709,22 +685,14 @@ def format_duration(
         seconds % 3600
     ) // 60
 
-    seconds = seconds % 60
-
-    return (
-        f"{hours:02d}:"
-        f"{minutes:02d}:"
-        f"{seconds:02d}"
-    )
+    return f"{hours}h {minutes}m"
 
 
 # ============================================================
 # LIVE CAMERA PROCESSOR
 # ============================================================
 
-class FaceCameraProcessor(
-    VideoProcessorBase
-):
+class FaceCameraProcessor(VideoProcessorBase):
 
     def __init__(self):
 
@@ -732,12 +700,9 @@ class FaceCameraProcessor(
 
         self.latest_frame = None
 
-        self.lock = None
+        self.lock = threading.Lock()
 
-    def recv(
-        self,
-        frame
-    ):
+    def recv(self, frame):
 
         image = frame.to_ndarray(
             format="bgr24"
@@ -745,14 +710,17 @@ class FaceCameraProcessor(
 
         self.frame_count += 1
 
-        # Store latest frame
         if (
             self.frame_count
             % PROCESS_EVERY_N_FRAMES
             == 0
         ):
 
-            self.latest_frame = image.copy()
+            with self.lock:
+
+                self.latest_frame = (
+                    image.copy()
+                )
 
         return av.VideoFrame.from_ndarray(
             image,
@@ -761,22 +729,23 @@ class FaceCameraProcessor(
 
 
 # ============================================================
-# HEADER
+# SESSION STATE
 # ============================================================
 
-st.markdown(
-    '<div class="app-title">'
-    'Employee Attendance System'
-    '</div>',
-    unsafe_allow_html=True
-)
+if "last_recognition" not in st.session_state:
+    st.session_state.last_recognition = None
 
-st.markdown(
-    '<div class="app-subtitle">'
-    'Live face verification and automated employee attendance'
-    '</div>',
-    unsafe_allow_html=True
-)
+if "last_distance" not in st.session_state:
+    st.session_state.last_distance = None
+
+if "last_event_message" not in st.session_state:
+    st.session_state.last_event_message = None
+
+if "last_event_type" not in st.session_state:
+    st.session_state.last_event_type = None
+
+if "camera_running" not in st.session_state:
+    st.session_state.camera_running = False
 
 
 # ============================================================
@@ -786,475 +755,427 @@ st.markdown(
 with st.sidebar:
 
     st.markdown(
-        "### System"
+        "### Employee Attendance"
     )
+
+    page = st.radio(
+        "Navigation",
+        [
+            "Live Attendance",
+            "Register Employee",
+            "Attendance History",
+            "Employees",
+        ],
+    )
+
+    st.markdown("---")
 
     st.markdown(
-        '<p class="status-online">'
-        'System Online'
-        '</p>',
-        unsafe_allow_html=True
+        """
+        **System**
+
+        Face recognition: Active  
+        Attendance mode: Automatic  
+        Event sequence: Check-in / Check-out  
+        Duplicate protection: 60 seconds
+        """
     )
-
-    st.divider()
-
-    st.write(
-        f"Version: {APP_VERSION}"
-    )
-
-    st.write(
-        f"Recognition Model: {MODEL_NAME}"
-    )
-
-    st.write(
-        f"Face Detector: {DETECTOR_BACKEND}"
-    )
-
-    st.write(
-        f"Match Threshold: {MATCH_THRESHOLD}"
-    )
-
-    st.write(
-        f"Scan Cooldown: "
-        f"{SCAN_COOLDOWN_SECONDS} seconds"
-    )
-
-    st.divider()
-
-    st.caption(
-        "Prototype environment"
-    )
-
-
-# ============================================================
-# DASHBOARD
-# ============================================================
-
-employees = load_employees()
-
-attendance = load_attendance()
-
-today = datetime.now().strftime(
-    "%Y-%m-%d"
-)
-
-today_records = attendance[
-    attendance["Date"] == today
-]
-
-checked_in_ids = set(
-    today_records[
-        today_records["Event"] == "CHECK-IN"
-    ]["Employee ID"]
-    .tolist()
-)
-
-checked_out_ids = set(
-    today_records[
-        today_records["Event"] == "CHECK-OUT"
-    ]["Employee ID"]
-    .tolist()
-)
-
-active_ids = (
-    checked_in_ids
-    - checked_out_ids
-)
-
-c1, c2, c3, c4 = st.columns(4)
-
-with c1:
-
-    st.metric(
-        "Registered Employees",
-        len(employees)
-    )
-
-with c2:
-
-    st.metric(
-        "Today's Events",
-        len(today_records)
-    )
-
-with c3:
-
-    st.metric(
-        "Currently Inside",
-        len(active_ids)
-    )
-
-with c4:
-
-    st.metric(
-        "System Status",
-        "Online"
-    )
-
-
-st.divider()
-
-
-# ============================================================
-# TABS
-# ============================================================
-
-attendance_tab, registration_tab, records_tab = st.tabs(
-    [
-        "Live Attendance",
-        "Employee Registration",
-        "Attendance Records"
-    ]
-)
 
 
 # ============================================================
 # LIVE ATTENDANCE
 # ============================================================
 
-with attendance_tab:
+if page == "Live Attendance":
 
     st.markdown(
         '<div class="section-title">'
-        'Live Employee Verification'
+        'Live Attendance'
         '</div>',
         unsafe_allow_html=True
     )
 
-    st.markdown(
-        '<div class="section-description">'
-        'Start the camera. The system automatically detects '
-        'and verifies employees without requiring a capture button.'
-        '</div>',
-        unsafe_allow_html=True
-    )
+    employees = load_employees()
 
     if not employees:
 
         st.warning(
-            "No employees are registered. "
-            "Register an employee first."
+            "No employees registered. "
+            "Please register an employee first."
         )
 
     else:
 
-        # Refresh the Streamlit page periodically
-        st_autorefresh(
-            interval=1000,
-            key="attendance_refresh"
+        col1, col2 = st.columns(
+            [2.2, 1]
         )
 
-        webrtc_ctx = webrtc_streamer(
-            key="employee-attendance-camera",
-            mode=WebRtcMode.SENDRECV,
-            video_processor_factory=FaceCameraProcessor,
-            media_stream_constraints={
-                "video": {
-                    "width": 640,
-                    "height": 480
+        with col1:
+
+            st.markdown(
+                """
+                <div class="info-box">
+                    Stand in front of the camera.
+                    The system will automatically detect
+                    and recognize the employee.
+                    No manual attendance button is required.
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+            st.write("")
+
+            webrtc_ctx = webrtc_streamer(
+                key="employee-attendance-camera",
+
+                mode=WebRtcMode.SENDRECV,
+
+                video_processor_factory=(
+                    FaceCameraProcessor
+                ),
+
+                media_stream_constraints={
+                    "video": {
+                        "width": 640,
+                        "height": 480
+                    },
+                    "audio": False,
                 },
-                "audio": False
-            },
-            async_processing=True
-        )
 
-        st.info(
-            "Position one employee in front of the camera. "
-            "Keep the face clearly visible."
-        )
-
-        # ----------------------------------------
-        # PROCESS LATEST FRAME
-        # ----------------------------------------
-
-        if (
-            webrtc_ctx.state.playing
-            and webrtc_ctx.video_processor
-        ):
-
-            processor = (
-                webrtc_ctx.video_processor
+                async_processing=True,
             )
 
-            frame = (
-                processor.latest_frame
-            )
+            if webrtc_ctx.state.playing:
 
-            if frame is not None:
+                st.session_state.camera_running = True
 
-                temp_path = None
+                # Refresh UI every second
+                st_autorefresh(
+                    interval=1000,
+                    key="attendance_refresh"
+                )
 
-                try:
+                processor = (
+                    webrtc_ctx.video_processor
+                )
 
-                    # Resize for faster processing
-                    height, width = frame.shape[:2]
+                if processor is not None:
 
-                    max_width = 640
+                    frame = None
 
-                    if width > max_width:
+                    with processor.lock:
 
-                        scale = (
-                            max_width / width
-                        )
+                        if (
+                            processor.latest_frame
+                            is not None
+                        ):
 
-                        frame = cv2.resize(
-                            frame,
-                            (
-                                int(width * scale),
-                                int(height * scale)
-                            )
-                        )
-
-                    # Save current frame
-                    with tempfile.NamedTemporaryFile(
-                        suffix=".jpg",
-                        delete=False
-                    ) as temp_file:
-
-                        cv2.imwrite(
-                            temp_file.name,
-                            frame
-                        )
-
-                        temp_path = (
-                            temp_file.name
-                        )
-
-                    with st.spinner(
-                        "Verifying face..."
-                    ):
-
-                        embedding = (
-                            generate_embedding(
-                                temp_path
-                            )
-                        )
-
-                        employee_id, distance = (
-                            recognize_employee(
-                                embedding
-                            )
-                        )
-
-                    if employee_id:
-
-                        result = record_event(
-                            employee_id
-                        )
-
-                        if result["cooldown"]:
-
-                            st.warning(
-                                "Employee already scanned. "
-                                f"Please wait "
-                                f"{result['remaining']} seconds."
+                            frame = (
+                                processor.latest_frame.copy()
                             )
 
-                        elif result["recorded"]:
-
-                            if (
-                                result["event"]
-                                == "CHECK-IN"
-                            ):
-
-                                st.success(
-                                    "Check-in recorded successfully."
-                                )
-
-                            else:
-
-                                st.success(
-                                    "Check-out recorded successfully."
-                                )
-
-                            x1, x2, x3, x4 = (
-                                st.columns(4)
-                            )
-
-                            with x1:
-
-                                st.metric(
-                                    "Employee ID",
-                                    result["employee_id"]
-                                )
-
-                            with x2:
-
-                                st.metric(
-                                    "Employee",
-                                    result["employee_name"]
-                                )
-
-                            with x3:
-
-                                st.metric(
-                                    "Event",
-                                    result["event"]
-                                )
-
-                            with x4:
-
-                                st.metric(
-                                    "Time",
-                                    result["time"]
-                                )
-
-                            summary = (
-                                calculate_daily_summary(
-                                    employee_id,
-                                    result["date"]
-                                )
-                            )
-
-                            st.divider()
-
-                            st.markdown(
-                                "#### Today's Summary"
-                            )
-
-                            s1, s2, s3, s4 = (
-                                st.columns(4)
-                            )
-
-                            with s1:
-
-                                st.metric(
-                                    "First Check-in",
-                                    summary[
-                                        "first_checkin"
-                                    ]
-                                )
-
-                            with s2:
-
-                                st.metric(
-                                    "Last Check-out",
-                                    summary[
-                                        "last_checkout"
-                                    ]
-                                )
-
-                            with s3:
-
-                                st.metric(
-                                    "Office Visits",
-                                    summary[
-                                        "visits"
-                                    ]
-                                )
-
-                            with s4:
-
-                                st.metric(
-                                    "Working Time",
-                                    format_duration(
-                                        summary[
-                                            "working_seconds"
-                                        ]
-                                    )
-                                )
-
-                            st.caption(
-                                f"Recognition distance: "
-                                f"{distance:.4f}"
-                            )
-
-                    else:
-
-                        st.warning(
-                            "Face detected, but no registered "
-                            "employee matched."
-                        )
-
-                        if distance != float("inf"):
-
-                            st.caption(
-                                f"Best distance: "
-                                f"{distance:.4f}"
-                            )
-
-                except ValueError as error:
-
-                    st.warning(
-                        f"Face processing: {error}"
-                    )
-
-                except Exception as error:
-
-                    st.error(
-                        "Verification error."
-                    )
-
-                    with st.expander(
-                        "Technical details"
-                    ):
-
-                        st.code(
-                            str(error)
-                        )
-
-                finally:
-
-                    if (
-                        temp_path
-                        and os.path.exists(
-                            temp_path
-                        )
-                    ):
+                    if frame is not None:
 
                         try:
 
-                            os.remove(
-                                temp_path
+                            # Resize for faster processing
+                            height, width = (
+                                frame.shape[:2]
                             )
 
-                        except Exception:
+                            max_width = 640
 
-                            pass
+                            if width > max_width:
+
+                                scale = (
+                                    max_width
+                                    / width
+                                )
+
+                                frame = cv2.resize(
+                                    frame,
+                                    (
+                                        int(
+                                            width
+                                            * scale
+                                        ),
+                                        int(
+                                            height
+                                            * scale
+                                        ),
+                                    ),
+                                )
+
+                            image_path = (
+                                save_numpy_image(
+                                    frame
+                                )
+                            )
+
+                            try:
+
+                                embedding = (
+                                    generate_embedding(
+                                        image_path
+                                    )
+                                )
+
+                            finally:
+
+                                try:
+                                    os.remove(
+                                        image_path
+                                    )
+                                except Exception:
+                                    pass
+
+                            employee, distance = (
+                                recognize_employee(
+                                    embedding
+                                )
+                            )
+
+                            if employee:
+
+                                employee_id = (
+                                    employee[
+                                        "employee_id"
+                                    ]
+                                )
+
+                                employee_name = (
+                                    employee[
+                                        "employee_name"
+                                    ]
+                                )
+
+                                st.session_state.last_recognition = (
+                                    employee
+                                )
+
+                                st.session_state.last_distance = (
+                                    distance
+                                )
+
+                                result = record_event(
+                                    employee_id,
+                                    employee_name
+                                )
+
+                                if result["success"]:
+
+                                    st.session_state.last_event_message = (
+                                        result[
+                                            "message"
+                                        ]
+                                    )
+
+                                    st.session_state.last_event_type = (
+                                        result[
+                                            "event"
+                                        ]
+                                    )
+
+                                else:
+
+                                    st.session_state.last_event_message = (
+                                        result[
+                                            "message"
+                                        ]
+                                    )
+
+                                    st.session_state.last_event_type = (
+                                        None
+                                    )
+
+                        except Exception as e:
+
+                            error_text = str(e)
+
+                            if (
+                                "No face detected"
+                                not in error_text
+                            ):
+
+                                st.session_state.last_event_message = (
+                                    "Face processing error: "
+                                    + error_text
+                                )
+
+        with col2:
+
+            st.markdown(
+                '<div class="section-title">'
+                'Current Status'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+            if (
+                st.session_state.last_recognition
+                is not None
+            ):
+
+                employee = (
+                    st.session_state.last_recognition
+                )
+
+                st.markdown(
+                    f"""
+                    <div class="employee-card">
+                        <div class="employee-name">
+                            {employee["employee_name"]}
+                        </div>
+                        <div class="employee-id">
+                            Employee ID:
+                            {employee["employee_id"]}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+                distance = (
+                    st.session_state.last_distance
+                )
+
+                if distance is not None:
+
+                    st.metric(
+                        "Face Distance",
+                        f"{distance:.4f}"
+                    )
+
+                message = (
+                    st.session_state.last_event_message
+                )
+
+                if message:
+
+                    event_type = (
+                        st.session_state.last_event_type
+                    )
+
+                    if event_type == "CHECK-IN":
+
+                        st.success(message)
+
+                    elif event_type == "CHECK-OUT":
+
+                        st.info(message)
+
+                    else:
+
+                        st.warning(message)
+
+                employee_id = (
+                    employee[
+                        "employee_id"
+                    ]
+                )
+
+                total_seconds, visits = (
+                    calculate_employee_working_time(
+                        employee_id
+                    )
+                )
+
+                st.metric(
+                    "Today's Working Time",
+                    format_duration(
+                        total_seconds
+                    )
+                )
+
+                st.metric(
+                    "Completed Visits",
+                    visits
+                )
+
+                next_event = (
+                    get_next_event(
+                        employee_id
+                    )
+                )
+
+                st.markdown(
+                    f"""
+                    <div class="status-box">
+                        <div class="status-title">
+                            Next attendance event
+                        </div>
+                        <div class="status-value">
+                            {next_event.replace("-", " ")}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+            else:
+
+                st.markdown(
+                    """
+                    <div class="status-box">
+                        <div class="status-title">
+                            Recognition Status
+                        </div>
+                        <div class="status-value">
+                            Waiting for employee
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
 
 
 # ============================================================
-# EMPLOYEE REGISTRATION
+# REGISTER EMPLOYEE
 # ============================================================
 
-with registration_tab:
+elif page == "Register Employee":
 
     st.markdown(
         '<div class="section-title">'
-        'Employee Registration'
+        'Register Employee'
         '</div>',
         unsafe_allow_html=True
     )
 
     st.markdown(
-        '<div class="section-description">'
-        'Register an employee once. The generated facial '
-        'template will be used for automatic verification.'
-        '</div>',
+        """
+        <div class="info-box">
+            Register one employee at a time.
+            Capture a clear front-facing image with
+            only one person visible.
+        </div>
+        """,
         unsafe_allow_html=True
     )
 
-    left, right = st.columns(
+    st.write("")
+
+    col1, col2 = st.columns(
         [1, 1]
     )
 
-    with left:
+    with col1:
 
-        new_employee_id = st.text_input(
+        employee_id = st.text_input(
             "Employee ID",
-            placeholder="EMP002"
+            placeholder="EMP001"
         )
 
-        new_employee_name = st.text_input(
+        employee_name = st.text_input(
             "Employee Name",
             placeholder="Employee full name"
         )
 
-    with right:
+    with col2:
 
-        registration_image = st.camera_input(
-            "Registration Photo",
-            key="employee_registration"
+        camera_image = st.camera_input(
+            "Capture Employee Face"
         )
 
     if st.button(
@@ -1263,82 +1184,95 @@ with registration_tab:
         use_container_width=True
     ):
 
-        employee_id = (
-            new_employee_id
-            .strip()
-            .upper()
-        )
-
-        employee_name = (
-            new_employee_name
-            .strip()
-        )
-
-        if not employee_id:
+        if not employee_id.strip():
 
             st.error(
-                "Employee ID is required."
+                "Please enter Employee ID."
             )
 
-        elif not employee_name:
+        elif not employee_name.strip():
 
             st.error(
-                "Employee Name is required."
+                "Please enter Employee Name."
             )
 
-        elif registration_image is None:
+        elif camera_image is None:
 
             st.error(
-                "Registration photo is required."
+                "Please capture employee image."
             )
 
         else:
 
             employees = load_employees()
 
+            employee_id = (
+                employee_id.strip()
+            )
+
+            employee_name = (
+                employee_name.strip()
+            )
+
             if employee_id in employees:
 
                 st.error(
-                    f"Employee {employee_id} "
-                    "is already registered."
+                    "Employee ID already exists."
                 )
 
             else:
 
-                temp_path = None
+                image_path = None
 
                 try:
 
-                    with tempfile.NamedTemporaryFile(
-                        suffix=".jpg",
-                        delete=False
-                    ) as temp_file:
+                    image_path = (
+                        save_uploaded_image(
+                            camera_image
+                        )
+                    )
 
-                        temp_file.write(
-                            registration_image.getvalue()
+                    embedding = (
+                        generate_embedding(
+                            image_path
+                        )
+                    )
+
+                    face_image_path = os.path.join(
+                        KNOWN_FACES_DIR,
+                        f"{employee_id}.jpg"
+                    )
+
+                    image_bytes = (
+                        camera_image.getvalue()
+                    )
+
+                    with open(
+                        face_image_path,
+                        "wb"
+                    ) as f:
+
+                        f.write(
+                            image_bytes
                         )
 
-                        temp_path = (
-                            temp_file.name
-                        )
+                    employees[
+                        employee_id
+                    ] = {
 
-                    with st.spinner(
-                        "Creating facial template..."
-                    ):
+                        "name":
+                            employee_name,
 
-                        embedding = (
-                            generate_embedding(
-                                temp_path
-                            )
-                        )
+                        "embedding":
+                            embedding.tolist(),
 
-                    employees[employee_id] = {
-                        "name": employee_name,
-                        "embedding": embedding.tolist(),
-                        "registered_at": (
-                            datetime.now()
-                            .isoformat()
-                        )
+                        "registered_at":
+                            datetime.now().strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            ),
+
+                        "image":
+                            face_image_path,
                     }
 
                     save_employees(
@@ -1346,73 +1280,44 @@ with registration_tab:
                     )
 
                     st.success(
-                        f"Employee {employee_id} "
+                        f"{employee_name} "
                         "registered successfully."
                     )
 
-                except ValueError as error:
+                except Exception as e:
 
                     st.error(
-                        f"Registration failed: {error}"
+                        f"Registration failed: {e}"
                     )
-
-                except Exception as error:
-
-                    st.error(
-                        "Registration failed."
-                    )
-
-                    with st.expander(
-                        "Technical details"
-                    ):
-
-                        st.code(
-                            str(error)
-                        )
 
                 finally:
 
-                    if (
-                        temp_path
-                        and os.path.exists(
-                            temp_path
-                        )
-                    ):
+                    if image_path:
 
                         try:
-
                             os.remove(
-                                temp_path
+                                image_path
                             )
-
                         except Exception:
-
                             pass
 
 
 # ============================================================
-# ATTENDANCE RECORDS
+# ATTENDANCE HISTORY
 # ============================================================
 
-with records_tab:
+elif page == "Attendance History":
 
     st.markdown(
         '<div class="section-title">'
-        'Attendance Records'
+        'Attendance History'
         '</div>',
         unsafe_allow_html=True
     )
 
-    st.markdown(
-        '<div class="section-description">'
-        'Review employee entry and exit history.'
-        '</div>',
-        unsafe_allow_html=True
-    )
+    df = load_attendance()
 
-    records = load_attendance()
-
-    if records.empty:
+    if df.empty:
 
         st.info(
             "No attendance records available."
@@ -1420,127 +1325,322 @@ with records_tab:
 
     else:
 
-        employee_options = [
-            "All Employees"
-        ] + sorted(
-            records["Employee ID"]
-            .dropna()
-            .unique()
-            .tolist()
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp"],
+            errors="coerce"
         )
 
-        f1, f2 = st.columns(2)
+        df = df.sort_values(
+            "timestamp",
+            ascending=False
+        )
 
-        with f1:
+        col1, col2, col3 = st.columns(
+            [1, 1, 1]
+        )
 
-            selected_employee = st.selectbox(
-                "Employee",
-                employee_options
-            )
-
-        with f2:
+        with col1:
 
             selected_date = st.date_input(
                 "Date",
-                value=datetime.now().date()
+                value=date.today()
             )
 
-        filtered = records.copy()
+        with col2:
+
+            employee_options = [
+                "All Employees"
+            ] + sorted(
+                df[
+                    "employee_name"
+                ]
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+            )
+
+            selected_employee = (
+                st.selectbox(
+                    "Employee",
+                    employee_options
+                )
+            )
+
+        with col3:
+
+            event_options = [
+                "All Events",
+                "CHECK-IN",
+                "CHECK-OUT"
+            ]
+
+            selected_event = (
+                st.selectbox(
+                    "Event",
+                    event_options
+                )
+            )
+
+        filtered = df[
+            df["timestamp"].dt.date
+            == selected_date
+        ].copy()
 
         if selected_employee != "All Employees":
 
             filtered = filtered[
-                filtered["Employee ID"]
+                filtered[
+                    "employee_name"
+                ].astype(str)
                 == selected_employee
             ]
 
-        date_string = selected_date.strftime(
-            "%Y-%m-%d"
+        if selected_event != "All Events":
+
+            filtered = filtered[
+                filtered["event"]
+                == selected_event
+            ]
+
+        if filtered.empty:
+
+            st.info(
+                "No records found for selected filters."
+            )
+
+        else:
+
+            display_df = filtered[
+                [
+                    "employee_id",
+                    "employee_name",
+                    "event",
+                    "timestamp",
+                ]
+            ].copy()
+
+            display_df[
+                "timestamp"
+            ] = display_df[
+                "timestamp"
+            ].dt.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            csv_data = (
+                filtered.to_csv(
+                    index=False
+                ).encode("utf-8")
+            )
+
+            st.download_button(
+                "Download CSV",
+                data=csv_data,
+                file_name=(
+                    f"attendance_"
+                    f"{selected_date}.csv"
+                ),
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+
+# ============================================================
+# EMPLOYEE MANAGEMENT
+# ============================================================
+
+elif page == "Employees":
+
+    st.markdown(
+        '<div class="section-title">'
+        'Registered Employees'
+        '</div>',
+        unsafe_allow_html=True
+    )
+
+    employees = load_employees()
+
+    if not employees:
+
+        st.info(
+            "No employees registered."
         )
 
-        filtered = filtered[
-            filtered["Date"] == date_string
-        ]
+    else:
+
+        rows = []
+
+        for employee_id, employee in (
+            employees.items()
+        ):
+
+            total_seconds, visits = (
+                calculate_employee_working_time(
+                    employee_id
+                )
+            )
+
+            rows.append(
+                {
+                    "Employee ID":
+                        employee_id,
+
+                    "Employee Name":
+                        employee.get(
+                            "name",
+                            ""
+                        ),
+
+                    "Registered At":
+                        employee.get(
+                            "registered_at",
+                            ""
+                        ),
+
+                    "Today's Working Time":
+                        format_duration(
+                            total_seconds
+                        ),
+
+                    "Today's Visits":
+                        visits,
+                }
+            )
+
+        employee_df = pd.DataFrame(
+            rows
+        )
 
         st.dataframe(
-            filtered,
+            employee_df,
             use_container_width=True,
-            hide_index=True
+            hide_index=True,
         )
 
-        if selected_employee != "All Employees":
+        st.write("")
 
-            summary = calculate_daily_summary(
-                selected_employee,
-                date_string
+        st.markdown(
+            '<div class="section-title">'
+            'Employee Details'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        selected_id = st.selectbox(
+            "Select Employee",
+            list(employees.keys()),
+            format_func=lambda x:
+                f"{x} - {employees[x].get('name', '')}"
+        )
+
+        if selected_id:
+
+            employee = (
+                employees[selected_id]
             )
 
-            st.divider()
-
-            st.markdown(
-                "#### Daily Summary"
+            col1, col2 = st.columns(
+                [1, 2]
             )
 
-            a1, a2, a3, a4, a5 = (
-                st.columns(5)
-            )
+            with col1:
 
-            with a1:
-
-                st.metric(
-                    "First Check-in",
-                    summary["first_checkin"]
+                image_path = employee.get(
+                    "image"
                 )
 
-            with a2:
-
-                st.metric(
-                    "Last Check-out",
-                    summary["last_checkout"]
-                )
-
-            with a3:
-
-                st.metric(
-                    "Visits",
-                    summary["visits"]
-                )
-
-            with a4:
-
-                st.metric(
-                    "Working Time",
-                    format_duration(
-                        summary[
-                            "working_seconds"
-                        ]
+                if (
+                    image_path
+                    and os.path.exists(
+                        image_path
                     )
+                ):
+
+                    st.image(
+                        image_path,
+                        width=220
+                    )
+
+            with col2:
+
+                st.markdown(
+                    f"""
+                    <div class="employee-card">
+
+                        <div class="employee-name">
+                            {employee.get("name", "")}
+                        </div>
+
+                        <div class="employee-id">
+                            Employee ID:
+                            {selected_id}
+                        </div>
+
+                        <br>
+
+                        <div>
+                            Registered:
+                            {employee.get("registered_at", "")}
+                        </div>
+
+                    </div>
+                    """,
+                    unsafe_allow_html=True
                 )
 
-            with a5:
+                if st.button(
+                    "Delete Employee",
+                    type="secondary"
+                ):
 
-                st.metric(
-                    "Current Status",
-                    summary["status"]
-                )
+                    del employees[
+                        selected_id
+                    ]
 
-        st.download_button(
-            "Download Attendance Report",
-            data=filtered.to_csv(
-                index=False
-            ),
-            file_name="attendance_report.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
+                    save_employees(
+                        employees
+                    )
+
+                    image_path = os.path.join(
+                        KNOWN_FACES_DIR,
+                        f"{selected_id}.jpg"
+                    )
+
+                    if os.path.exists(
+                        image_path
+                    ):
+
+                        try:
+                            os.remove(
+                                image_path
+                            )
+                        except Exception:
+                            pass
+
+                    st.success(
+                        "Employee deleted successfully."
+                    )
+
+                    st.rerun()
 
 
 # ============================================================
 # FOOTER
 # ============================================================
 
-st.divider()
-
-st.caption(
-    f"{APP_NAME} | Prototype Version {APP_VERSION}"
+st.markdown(
+    """
+    <div class="footer-text">
+        Employee Attendance System
+        | Automated Face Recognition
+    </div>
+    """,
+    unsafe_allow_html=True
 )
