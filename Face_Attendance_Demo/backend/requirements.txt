@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-multipart
+opencv-python-headless
+numpy==1.26.4
+pandas==2.2.3
+deepface==0.0.100
+retina-face==0.0.17
+tensorflow==2.21.0
+tf-keras

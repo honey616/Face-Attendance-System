@@ -5,9 +5,7 @@ Employee Face Attendance System
 Streamlit + DeepFace (Facenet512 / retinaface / cosine) + streamlit-webrtc.
 
 * Attendance: live camera, automatic capture after a 5 second countdown, no
-  capture button. The countdown is drawn on the live video. A result card shows
-  the captured frame and the outcome. DeepFace recognition runs ONLY on the
-  captured frame.
+  capture button, no overlays. DeepFace runs ONLY on the captured frame.
 * Employee Registration: step-by-step front / left / right capture, one
   camera at a time.
 * Attendance Records: filterable table with CSV export and a daily summary.
@@ -21,7 +19,6 @@ import hashlib
 import html
 import json
 import logging
-import math
 import os
 import re
 import threading
@@ -36,7 +33,6 @@ from zoneinfo import ZoneInfo
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 
-import av  # noqa: E402
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -117,7 +113,6 @@ WEBRTC_KEY = "attendance_camera"
 REG_STATE_KEY = "registration"
 REG_EPOCH_KEY = "registration_epoch"
 REG_NOTICE_KEY = "registration_notice"
-LAST_CAPTURE_KEY = "attendance_last_capture"
 
 # User-facing messages (kept short and free of technical details)
 MSG_NO_FACE = "Waiting for employee..."
@@ -125,15 +120,9 @@ MSG_MULTIPLE_FACES = "Only one employee should be visible."
 MSG_VERIFICATION_FAILED = "Employee verification failed."
 MSG_VERIFICATION_ERROR = "Verification could not be completed. Please try again."
 MSG_NO_EMPLOYEES = "No employees are registered yet. Please register an employee first."
-MSG_CAMERA_START = (
-    "Click START below to turn on the camera. When your browser asks, choose Allow. "
-    "If camera access was blocked, enable it from the camera icon in the browser's "
-    "address bar, then press START again (or refresh the page)."
-)
 MSG_CAMERA_TIMEOUT = (
-    "Camera access has not been granted yet. Please allow camera permission when your "
-    "browser asks. If it was blocked, enable it from the address bar, then press STOP and "
-    "START again or refresh the page."
+    "Camera access has not been granted yet. Please allow camera access when your browser "
+    "asks — this page connects automatically once access is granted."
 )
 MSG_CAMERA_LOST = "The camera connection was interrupted. Reconnecting automatically..."
 MSG_SAVE_ATTENDANCE_FAILED = (
@@ -454,31 +443,13 @@ class RecognitionResult:
     show_spinner="Preparing the face recognition engine. The first start can take a few minutes."
 )
 def warm_up_face_engine() -> bool:
-    """
-    Load the recognition and detection models once.
-
-    NOTE: main() intentionally does not call this, because loading can take
-    minutes and would block the page (and the camera) from appearing. Models
-    load lazily the first time they are needed. Call it only if you want an
-    eager warm-up.
-    """
+    """Load the recognition and detection models once, before the first scan."""
     try:
-        DeepFace.build_model(
-            model_name=MODEL_NAME,
-            task="facial_recognition"
-        )
-
-        DeepFace.build_model(
-            model_name=DETECTOR_BACKEND,
-            task="face_detector"
-        )
-
+        DeepFace.build_model(model_name=MODEL_NAME, task="facial_recognition")
+        DeepFace.build_model(model_name=DETECTOR_BACKEND, task="face_detector")
         return True
-
     except Exception:
-        logger.exception(
-            "Model warm-up failed; models will load on first use"
-        )
+        logger.exception("Model warm-up failed; models will load on first use")
         return False
 
 
@@ -539,19 +510,10 @@ def count_valid_faces(frame_bgr: Optional[np.ndarray]) -> int:
     cheap enough to run on every polled frame while watching for a single
     employee to step in front of the camera. It never calls the recognition
     model and is not a second recognition system.
-
-    Wide frames are downscaled for detection only (the captured frame used for
-    recognition is never downscaled) so the countdown ticks smoothly.
     """
     if frame_bgr is None or not isinstance(frame_bgr, np.ndarray) or frame_bgr.size == 0:
         return 0
     try:
-        height, width = frame_bgr.shape[:2]
-        if width > 640:
-            scale = 640.0 / width
-            frame_bgr = cv2.resize(
-                frame_bgr, (640, max(1, int(height * scale))), interpolation=cv2.INTER_AREA
-            )
         faces = DeepFace.extract_faces(
             img_path=frame_bgr,
             detector_backend=DETECTOR_BACKEND,
@@ -669,16 +631,14 @@ def register_employee(
 
 
 # =============================================================================
-# WEBRTC (lightweight: keeps the latest frame, draws the countdown overlay)
+# WEBRTC (lightweight: only keeps the latest frame)
 # =============================================================================
 class LatestFrameProcessor(VideoProcessorBase):
     """
-    Stores the newest (clean) camera frame and returns it to the browser.
+    Stores the newest camera frame and returns it untouched.
 
-    While a countdown value is set, the number is drawn on the frame that is
-    sent back to the browser, so it appears ON the live video preview. The
-    stored frame is always the clean one, so recognition never sees the overlay.
-    It does not detect faces or call DeepFace.
+    It does not detect faces, draw anything or call DeepFace, so the live
+    video stays clean and the processor stays lightweight.
     """
 
     def __init__(self) -> None:
@@ -686,46 +646,12 @@ class LatestFrameProcessor(VideoProcessorBase):
         self._lock = threading.Lock()
         self._frame = None
         self._last_frame_at = 0.0
-        self._countdown_value: Optional[int] = None
-
-    def set_countdown(self, value: Optional[int]) -> None:
-        """Set the countdown number drawn directly on the live camera video."""
-        with self._lock:
-            self._countdown_value = int(value) if value is not None else None
 
     def recv(self, frame):  # av.VideoFrame -> av.VideoFrame
         with self._lock:
             self._frame = frame
             self._last_frame_at = time.monotonic()
-            countdown = self._countdown_value
-
-        if countdown is None:
-            return frame
-
-        try:
-            image = frame.to_ndarray(format="bgr24")
-            h, w = image.shape[:2]
-            overlay = image.copy()
-            box_w = min(360, max(260, w // 3))
-            box_h = 150
-            x1 = max(0, (w - box_w) // 2)
-            y1 = max(20, (h - box_h) // 2)
-            x2 = min(w, x1 + box_w)
-            y2 = min(h, y1 + box_h)
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), (15, 23, 42), -1)
-            cv2.addWeighted(overlay, 0.82, image, 0.18, 0, image)
-            cv2.rectangle(image, (x1, y1), (x2, y2), (59, 130, 246), 3)
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            label = "CAPTURING IN"
-            number = str(int(countdown))
-            (lw, _lh), _ = cv2.getTextSize(label, font, 0.75, 2)
-            (nw, _nh), _ = cv2.getTextSize(number, font, 3.2, 7)
-            cv2.putText(image, label, ((w - lw) // 2, y1 + 42), font, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(image, number, ((w - nw) // 2, y1 + 120), font, 3.2, (255, 255, 255), 7, cv2.LINE_AA)
-            return av.VideoFrame.from_ndarray(image, format="bgr24")
-        except Exception:
-            logger.exception("Could not draw the countdown overlay")
-            return frame
+        return frame
 
     def has_recent_frame(self, max_age: float) -> bool:
         with self._lock:
@@ -907,28 +833,13 @@ def reset_attendance_session() -> None:
     """Drop the camera session when the user leaves the Attendance section."""
     st.session_state.pop(WEBRTC_KEY, None)
     st.session_state.pop("attendance_webrtc_ctx", None)
-    st.session_state.pop(LAST_CAPTURE_KEY, None)
     _reset_attendance_monitor_state()
 
 
 def make_outcome(
-    kind: str,
-    message: str,
-    captured: bool = False,
-    summary: Optional[pd.DataFrame] = None,
-    employee_name: Optional[str] = None,
-    event: Optional[str] = None,
-    time_text: Optional[str] = None,
+    kind: str, message: str, captured: bool = False, summary: Optional[pd.DataFrame] = None
 ) -> Dict[str, Any]:
-    return {
-        "kind": kind,
-        "message": message,
-        "captured": captured,
-        "summary": summary,
-        "employee_name": employee_name,
-        "event": event,
-        "time_text": time_text,
-    }
+    return {"kind": kind, "message": message, "captured": captured, "summary": summary}
 
 
 def render_outcome(placeholder: Any, outcome: Dict[str, Any]) -> None:
@@ -938,69 +849,7 @@ def render_outcome(placeholder: Any, outcome: Dict[str, Any]) -> None:
         summary = outcome.get("summary")
         if summary is not None and not summary.empty:
             st.markdown("**Today's Summary**")
-            st.dataframe(summary, hide_index=True, width="stretch")
-
-
-def encode_capture_jpeg(frame_bgr: Optional[np.ndarray], max_width: int = 640) -> Optional[bytes]:
-    """
-    JPEG bytes of the captured frame, for display only. Recognition always uses
-    the full-resolution frame, never this display copy.
-    """
-    if frame_bgr is None or not isinstance(frame_bgr, np.ndarray) or frame_bgr.size == 0:
-        return None
-    try:
-        image = frame_bgr
-        height, width = image.shape[:2]
-        if width > max_width:
-            scale = max_width / float(width)
-            image = cv2.resize(
-                image, (max_width, max(1, int(height * scale))), interpolation=cv2.INTER_AREA
-            )
-        ok, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 88])
-        return buffer.tobytes() if ok else None
-    except Exception:
-        logger.exception("The captured frame could not be encoded for display")
-        return None
-
-
-def render_capture_card(placeholder: Any, capture: Dict[str, Any]) -> None:
-    """
-    Result card: captured camera image, status, employee, event and time.
-
-    Drawn only into a placeholder owned by the calling fragment. It is built
-    from the data in st.session_state["attendance_last_capture"].
-    """
-    outcome = capture.get("outcome")
-    with placeholder.container():
-        _, middle, _ = st.columns([1, 2, 1])
-        with middle:
-            jpeg = capture.get("jpeg")
-            if jpeg:
-                st.image(jpeg, caption="Captured camera image", width="stretch")
-            if outcome is None:
-                render_message("info", "Photo captured. Verifying. Please wait.")
-                return
-
-            titles = {
-                "success": "\u2713 Attendance Recorded",
-                "info": "Attendance Already Recorded",
-                "warning": "Attendance Not Recorded",
-                "error": "Attendance Not Recorded",
-            }
-            st.markdown(f"**{titles.get(outcome['kind'], 'Result')}**")
-            render_message(outcome["kind"], outcome["message"])
-
-            if outcome.get("employee_name"):
-                st.markdown(f"**Employee:** {outcome['employee_name']}")
-            if outcome.get("event"):
-                st.markdown(f"**Event:** {outcome['event']}")
-            if outcome.get("time_text"):
-                st.markdown(f"**Time:** {outcome['time_text']}")
-
-            summary = outcome.get("summary")
-            if summary is not None and not summary.empty:
-                st.markdown("**Today's Summary**")
-                st.dataframe(summary, hide_index=True, width="stretch")
+            st.dataframe(summary, hide_index=True, use_container_width=True)
 
 
 def process_captured_frame(frame_bgr: np.ndarray) -> Dict[str, Any]:
@@ -1025,9 +874,6 @@ def process_captured_frame(frame_bgr: np.ndarray) -> Dict[str, Any]:
                 f"{outcome.event} recorded for {result.employee_name} at {clock}.",
                 captured=True,
                 summary=summary,
-                employee_name=result.employee_name,
-                event=outcome.event,
-                time_text=clock,
             )
         return make_outcome(
             "info",
@@ -1035,9 +881,6 @@ def process_captured_frame(frame_bgr: np.ndarray) -> Dict[str, Any]:
             "Please wait a moment before scanning again.",
             captured=True,
             summary=summary,
-            employee_name=result.employee_name,
-            event=outcome.event,
-            time_text=clock,
         )
 
     kind = {
@@ -1055,8 +898,6 @@ def _attendance_state_defaults() -> None:
     st.session_state.setdefault("attendance_hold_until", 0.0)
     st.session_state.setdefault("attendance_stale_since", None)
     st.session_state.setdefault("attendance_ever_connected", False)
-    st.session_state.setdefault(LAST_CAPTURE_KEY, None)
-    st.session_state.setdefault("attendance_popup_until", 0.0)
 
 
 def _reset_attendance_monitor_state() -> None:
@@ -1064,174 +905,112 @@ def _reset_attendance_monitor_state() -> None:
     st.session_state["attendance_hold_until"] = 0.0
     st.session_state["attendance_stale_since"] = None
     st.session_state["attendance_ever_connected"] = False
-    st.session_state["attendance_popup_until"] = 0.0
 
 
-def _cancel_countdown(processor: Any) -> None:
-    """Reset the countdown and remove the overlay from the live video."""
-    st.session_state["attendance_countdown_deadline"] = None
-    if processor is not None:
-        processor.set_countdown(None)
-
-
-@st.fragment(run_every=FACE_POLL_INTERVAL_SECONDS)
-def _attendance_monitor_fragment() -> None:
+@st.fragment(run_every=0.35)
+def _attendance_monitor_fragment(
+    dashboard_placeholder: Any,
+    camera_status_placeholder: Any,
+    detection_placeholder: Any,
+) -> None:
     """
     Poll one camera frame per fragment run without blocking Streamlit's main
-    script. This is important for WebRTC: the component must be allowed to
+    script.  This is important for WebRTC: the component must be allowed to
     finish its browser-side signalling/permission handshake while the Python
     side waits for frames.
-
-    The fragment creates its OWN placeholders on every run and writes only to
-    them. It never writes to a container created outside the fragment, which is
-    what caused StreamlitInvalidLayoutContextError. The dashboard is refreshed
-    by a normal app rerun after attendance is recorded.
-
-    The WebRTC camera is never stopped or recreated here.
     """
     _attendance_state_defaults()
 
-    status_slot = st.empty()
-    detection_slot = st.empty()
-
-    # The WebRTC context is stored after the component is rendered.
+    # The WebRTC context is stored after the component is rendered.  If this
+    # fragment fires before that first render has completed, simply wait for
+    # the next scheduled run.
     ctx = st.session_state.get("attendance_webrtc_ctx")
     if ctx is None:
-        st.session_state[LAST_CAPTURE_KEY] = None
-        status_slot.markdown("**Camera status:** Off")
-        render_message("info", MSG_CAMERA_START, detection_slot)
+        camera_status_placeholder.markdown("**Camera status:** Starting")
+        render_message("info", "Waiting for the camera to connect...", detection_placeholder)
         return
 
     processor = ctx.video_processor
-    state = getattr(ctx, "state", None)
-    playing = bool(getattr(state, "playing", False))
-    signalling = bool(getattr(state, "signalling", False))
     now = time.monotonic()
 
-    has_frames = processor is not None and processor.has_recent_frame(FRAME_STALE_SECONDS)
-
     # Camera not (yet, or no longer) delivering frames.
-    if not has_frames:
-        st.session_state[LAST_CAPTURE_KEY] = None
-
-        # The user has not pressed START (or has pressed STOP).
-        if not playing and not signalling:
-            _reset_attendance_monitor_state()
-            if processor is not None:
-                processor.set_countdown(None)
-            status_slot.markdown("**Camera status:** Off")
-            render_message("info", MSG_CAMERA_START, detection_slot)
-            return
-
+    if processor is None or not processor.has_recent_frame(FRAME_STALE_SECONDS):
         stale_since = st.session_state.get("attendance_stale_since")
         if stale_since is None:
             stale_since = now
             st.session_state["attendance_stale_since"] = stale_since
 
         if not st.session_state.get("attendance_ever_connected", False):
-            status_slot.markdown("**Camera status:** Starting")
+            camera_status_placeholder.markdown("**Camera status:** Starting")
             if now - stale_since > CAMERA_READY_TIMEOUT_SECONDS:
-                render_message("warning", MSG_CAMERA_TIMEOUT, detection_slot)
+                render_message("warning", MSG_CAMERA_TIMEOUT, detection_placeholder)
             else:
-                render_message("info", "Waiting for the camera to connect...", detection_slot)
+                render_message("info", "Waiting for the camera to connect...", detection_placeholder)
         else:
-            status_slot.markdown("**Camera status:** Reconnecting")
-            render_message("warning", MSG_CAMERA_LOST, detection_slot)
+            camera_status_placeholder.markdown("**Camera status:** Reconnecting")
+            render_message("warning", MSG_CAMERA_LOST, detection_placeholder)
 
-        _cancel_countdown(processor)
+        st.session_state["attendance_countdown_deadline"] = None
         return
 
     st.session_state["attendance_ever_connected"] = True
     st.session_state["attendance_stale_since"] = None
-    status_slot.markdown("**Camera status:** Active")
+    camera_status_placeholder.markdown("**Camera status:** Active")
 
-    # Keep the result card (captured image + outcome) visible for the
-    # configured display period, then return to watching for the next employee.
-    last_capture = st.session_state.get(LAST_CAPTURE_KEY)
-    if now < float(st.session_state.get("attendance_hold_until", 0.0)) and last_capture:
-        render_capture_card(detection_slot, last_capture)
+    # Briefly keep the last result visible before scanning again.
+    if now < float(st.session_state.get("attendance_hold_until", 0.0)):
         return
 
-    # Display period is over: clear the captured image and the result.
-    if last_capture is not None:
-        st.session_state[LAST_CAPTURE_KEY] = None
-
     if not load_employees():
-        _cancel_countdown(processor)
-        render_message("info", MSG_NO_EMPLOYEES, detection_slot)
+        st.session_state["attendance_countdown_deadline"] = None
+        render_message("info", MSG_NO_EMPLOYEES, detection_placeholder)
         return
 
     frame = processor.get_latest_frame_bgr()
     face_count = count_valid_faces(frame)
 
     if face_count == 0:
-        _cancel_countdown(processor)
-        render_message("info", MSG_NO_FACE, detection_slot)
+        st.session_state["attendance_countdown_deadline"] = None
+        render_message("info", MSG_NO_FACE, detection_placeholder)
         return
 
     if face_count > 1:
-        _cancel_countdown(processor)
-        render_message("warning", MSG_MULTIPLE_FACES, detection_slot)
+        st.session_state["attendance_countdown_deadline"] = None
+        render_message("warning", MSG_MULTIPLE_FACES, detection_placeholder)
         return
 
-    # Exactly one valid face: start/continue the 5-second countdown.
+    # Exactly one valid face: start/continue the existing 5-second countdown.
     deadline = st.session_state.get("attendance_countdown_deadline")
     if deadline is None:
         deadline = now + COUNTDOWN_SECONDS
         st.session_state["attendance_countdown_deadline"] = deadline
 
     remaining = float(deadline) - now
-    if remaining > 0:
-        countdown_value = min(COUNTDOWN_SECONDS, max(1, math.ceil(remaining)))
-        processor.set_countdown(countdown_value)
-        render_countdown(detection_slot, countdown_value)
+    if remaining > 0.05:
+        render_countdown(detection_placeholder, max(1, int(remaining) + 1))
         return
 
-    # Countdown finished: remove the overlay and capture the CURRENT live frame
-    # (the processor always stores the clean frame, without the countdown).
-    processor.set_countdown(None)
+    render_message("info", "Verifying. Please wait.", detection_placeholder)
     capture_frame = processor.get_latest_frame_bgr()
     if capture_frame is None:
-        _cancel_countdown(processor)
+        st.session_state["attendance_countdown_deadline"] = None
         return
 
-    # Store the captured image and show it immediately, before recognition.
-    capture: Dict[str, Any] = {"jpeg": encode_capture_jpeg(capture_frame), "outcome": None}
-    st.session_state[LAST_CAPTURE_KEY] = capture
-    render_capture_card(detection_slot, capture)
-
-    # DeepFace recognition runs only on this captured frame.
     try:
         outcome = process_captured_frame(capture_frame)
     except Exception:
         logger.exception("Unexpected error while processing the captured frame")
         outcome = make_outcome("error", MSG_VERIFICATION_ERROR, captured=True)
 
-    # Reset the countdown and keep watching. The WebRTC camera is not stopped.
-    _cancel_countdown(processor)
-    capture["outcome"] = outcome
-    st.session_state[LAST_CAPTURE_KEY] = capture
+    render_outcome(detection_placeholder, outcome)
+    render_dashboard(dashboard_placeholder)
+
+    # Reset and keep watching. The WebRTC camera is not stopped.
+    st.session_state["attendance_countdown_deadline"] = None
     st.session_state["attendance_hold_until"] = time.monotonic() + RESULT_DISPLAY_SECONDS
 
-    # Use a lightweight toast for the immediate popup-style confirmation.
-    # The captured image/result card stays in the attendance area below the
-    # live camera. No rerun is triggered, so the WebRTC camera keeps running.
-    if outcome.get("kind") == "success":
-        st.toast("✓ Attendance Recorded", icon="✅")
-    elif outcome.get("kind") == "info":
-        st.toast("Attendance already recorded", icon="ℹ️")
-    else:
-        st.toast("Attendance could not be recorded", icon="⚠️")
 
-    render_capture_card(detection_slot, capture)
-
-    # IMPORTANT: do NOT call st.rerun() here. A full rerun can recreate/reset
-    # the WebRTC component immediately after a capture. The fragment keeps the
-    # camera session alive, displays the captured image/result, and automatically
-    # resumes scanning after RESULT_DISPLAY_SECONDS.
-
-
-def render_attendance_page() -> None:
+def render_attendance_page(dashboard_placeholder: Any) -> None:
     st.subheader("Employee Attendance")
 
     _attendance_state_defaults()
@@ -1239,9 +1018,11 @@ def render_attendance_page() -> None:
     _, center, _ = st.columns([1, 2, 1])
     with center:
         try:
-            # Keep the standard WebRTC START/STOP control. One webrtc_streamer
-            # call with one fixed key, so the camera is never recreated on a
-            # rerun. The monitor below is non-blocking.
+            # IMPORTANT: do not run a while-loop after this call.  The browser
+            # side of streamlit-webrtc needs the main Streamlit script to return
+            # so its offer/answer and camera-permission handshake can complete.
+            # desired_playing_state=True keeps the final app fully automatic;
+            # the user never needs to press START.
             ctx = webrtc_streamer(
                 key=WEBRTC_KEY,
                 mode=WebRtcMode.SENDRECV,
@@ -1250,6 +1031,7 @@ def render_attendance_page() -> None:
                     "video": True,
                     "audio": False,
                 },
+                desired_playing_state=True,
                 media_toggle_controls=False,
                 video_processor_factory=LatestFrameProcessor,
                 async_processing=True,
@@ -1272,15 +1054,20 @@ def render_attendance_page() -> None:
 
         st.session_state["attendance_webrtc_ctx"] = ctx
 
-    st.caption(
-        "Attendance is captured automatically when exactly one face is detected. "
-        "The countdown appears on the camera preview."
-    )
+        camera_status_placeholder = st.empty()
+        detection_placeholder = st.empty()
+        st.caption(
+            "Automatically capturing when one valid face is detected. "
+            "Countdown appears only when exactly one face is detected."
+        )
 
-    # Non-blocking monitor. It reruns every 0.35 s on its own while the WebRTC
-    # component stays free to connect and stream frames. It owns its
-    # placeholders, so nothing outside the fragment is written from inside it.
-    _attendance_monitor_fragment()
+        # Non-blocking monitor. The fragment reruns every 0.35 s while the
+        # WebRTC component remains free to connect and stream frames.
+        _attendance_monitor_fragment(
+            dashboard_placeholder,
+            camera_status_placeholder,
+            detection_placeholder,
+        )
 
 
 # =============================================================================
@@ -1429,7 +1216,7 @@ def render_capture_step(reg: Dict[str, Any], step: int) -> None:
     _, center, _ = st.columns([1, 2, 1])
     with center:
         if stored_photo is not None:
-            st.image(stored_photo, caption=f"{VIEW_LABELS[view]} photo accepted", width="stretch")
+            st.image(stored_photo, caption=f"{VIEW_LABELS[view]} photo accepted", use_container_width=True)
         else:
             camera_photo = st.camera_input(
                 f"{VIEW_LABELS[view]} camera",
@@ -1450,7 +1237,7 @@ def render_capture_step(reg: Dict[str, Any], step: int) -> None:
         disabled=step == 1,
         on_click=_go_to_step,
         args=(step - 1,),
-        width="stretch",
+        use_container_width=True,
     )
     col_retake.button(
         "Retake This Photo",
@@ -1458,14 +1245,14 @@ def render_capture_step(reg: Dict[str, Any], step: int) -> None:
         disabled=stored_photo is None and camera_photo is None,
         on_click=_retake_photo,
         args=(view,),
-        width="stretch",
+        use_container_width=True,
     )
     next_clicked = col_next.button(
         "Continue to Review" if step == 3 else "Continue to Next Step",
         key=f"reg_next_{step}_{epoch}",
         type="primary",
         disabled=reg["images"][view] is None,
-        width="stretch",
+        use_container_width=True,
     )
 
     if next_clicked:
@@ -1490,7 +1277,7 @@ def render_review_step(reg: Dict[str, Any]) -> None:
 
     for col, view in zip(st.columns(3), FACE_VIEWS):
         with col:
-            st.image(reg["images"][view], caption=f"{VIEW_LABELS[view]} Photo", width="stretch")
+            st.image(reg["images"][view], caption=f"{VIEW_LABELS[view]} Photo", use_container_width=True)
 
     already_registered = reg["employee_id"] in load_employees()
     replace_confirmed = True
@@ -1509,20 +1296,20 @@ def render_review_step(reg: Dict[str, Any]) -> None:
         key=f"reg_back_review_{epoch}",
         on_click=_go_to_step,
         args=(3,),
-        width="stretch",
+        use_container_width=True,
     )
     col_restart.button(
         "Start Over",
         key=f"reg_restart_{epoch}",
         on_click=_reset_registration,
-        width="stretch",
+        use_container_width=True,
     )
     create_clicked = col_create.button(
         "Create Employee Face Profile",
         key=f"reg_create_{epoch}",
         type="primary",
         disabled=not replace_confirmed,
-        width="stretch",
+        use_container_width=True,
     )
 
     if create_clicked:
@@ -1552,7 +1339,7 @@ def render_registered_employees() -> None:
             }
             for employee_id, record in sorted(employees.items())
         ]
-        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 
 def render_registration_page() -> None:
@@ -1622,7 +1409,7 @@ def render_records_page() -> None:
     if filtered.empty:
         render_message("info", "No attendance records found for the selected filters.")
     else:
-        st.dataframe(filtered, hide_index=True, width="stretch")
+        st.dataframe(filtered, hide_index=True, use_container_width=True)
 
     file_date = "all_dates" if date_label == ALL_DATES else date_label
     st.download_button(
@@ -1639,7 +1426,7 @@ def render_records_page() -> None:
     if summary.empty:
         st.write("No attendance events for this date.")
     else:
-        st.dataframe(summary, hide_index=True, width="stretch")
+        st.dataframe(summary, hide_index=True, use_container_width=True)
 
 
 # =============================================================================
@@ -1666,9 +1453,7 @@ def main() -> None:
     dashboard_placeholder = st.empty()
     render_dashboard(dashboard_placeholder)
 
-    # Do NOT call warm_up_face_engine() here. Model loading can take several
-    # minutes and would block the WebRTC camera from appearing. Models load
-    # lazily when face detection/recognition is first needed.
+    warm_up_face_engine()
 
     section = st.radio(
         "Section",
@@ -1684,7 +1469,7 @@ def main() -> None:
         reset_attendance_session()
 
     if section == NAV_ATTENDANCE:
-        render_attendance_page()
+        render_attendance_page(dashboard_placeholder)
     elif section == NAV_REGISTRATION:
         render_registration_page()
     else:
